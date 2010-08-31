@@ -7,7 +7,11 @@
 #include "vtkDataObject.h"
 #include "vtkSmartPointer.h"
 
+#include <vtkMath.h>
+#include <vtkLookupTable.h>
 #include <vtkUnstructuredGrid.h>
+#include <vtkUnsignedCharArray.h>
+#include <vtkIdFilter.h>
 #include <vtkFloatArray.h>
 #include <vtkDoubleArray.h>
 #include <vtkPointData.h>
@@ -19,6 +23,8 @@
 #include <vtkSelection.h>
 #include <vtkExtractSelection.h>
 #include <vtkIdTypeArray.h>
+#include <vtkGraphWriter.h>
+#include <vtkExtractSelectedGraph.h>
 
 #include <vtkFullyConnectedGraphFilter.h>
 #include <vtkGraphBFSIterator.h>
@@ -31,6 +37,10 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+
+// For testing only
+#include <vtkGraphToPolyData.h>
+#include <vtkXMLPolyDataWriter.h>
 
 #define UNASSIGNED -1
 
@@ -58,15 +68,19 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   vtkPolyData *input = vtkPolyData::SafeDownCast(
     inInfo->Get(vtkDataObject::DATA_OBJECT()));
 
-      
+  vtkSmartPointer<vtkIdFilter> idFilter = 
+    vtkSmartPointer<vtkIdFilter>::New();
+  idFilter->SetInputConnection(input->GetProducerPort());
+  idFilter->SetIdsArrayName("OriginalIds");
+  idFilter->Update();
+     
   vtkDataArray* normalsInput = input->GetPointData()->GetNormals();
   if(!normalsInput)
     {
     std::cerr << " no input normals" << std::endl;
     exit(-1);
     }
-  //vtkDataArray* normalsInput = input->GetPointData()->GetArray("Normals");
-  
+    
   vtkPolyData *outputLabeled = vtkPolyData::SafeDownCast(
     outInfo0->Get(vtkDataObject::DATA_OBJECT()));
 
@@ -89,9 +103,41 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
     std::cout << "Automatic radius: " << this->NNRadius << std::endl;
     }
 
+  // Build a graph on all of the input points
+
+  vtkSmartPointer<vtkNearestNeighborGraphFilter> nnFilter =
+    vtkSmartPointer<vtkNearestNeighborGraphFilter>::New();
+  nnFilter->SetInputConnection(idFilter->GetOutputPort());
+  nnFilter->Update();
+  
+  // Connect the NN graph
+  vtkSmartPointer<vtkConnectGraph> connectFilter =
+    vtkSmartPointer<vtkConnectGraph>::New();
+  connectFilter->SetInputConnection(nnFilter->GetOutputPort());
+  connectFilter->Update();
+  
+  {
+  vtkSmartPointer<vtkGraphWriter> graphWriter = 
+    vtkSmartPointer<vtkGraphWriter>::New();
+  graphWriter->SetFileName("NNgraph.graph");
+  graphWriter->SetInputConnection(connectFilter->GetOutputPort());
+  graphWriter->Write();
+  
+  vtkSmartPointer<vtkGraphToPolyData> graphToPolyData = 
+    vtkSmartPointer<vtkGraphToPolyData>::New();
+  graphToPolyData->SetInputConnection(connectFilter->GetOutputPort());
+  graphToPolyData->Update();
+  
+  vtkSmartPointer<vtkXMLPolyDataWriter> graphPolyDataWriter = 
+    vtkSmartPointer<vtkXMLPolyDataWriter>::New();
+  graphPolyDataWriter->SetInputConnection(graphToPolyData->GetOutputPort());
+  graphPolyDataWriter->SetFileName("NNgraph.vtp");
+  graphPolyDataWriter->Write();
+    
+  }
+  
   //create a vector to keep track of the points that are already assigned to a superpoint
   std::vector<int> superPointLabels(input->GetNumberOfPoints(), UNASSIGNED);
-
  
   //Create a kd tree
   vtkSmartPointer<vtkKdTreePointLocator> kdTree =
@@ -103,18 +149,14 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   vtkSmartPointer<vtkPoints> superPointCenters =
     vtkSmartPointer<vtkPoints>::New();
 
-  //for(vtkIdType pointID = 0; pointID < input->GetNumberOfPoints(); ++pointID)
-  for(vtkIdType pointID = 0; pointID < 4000; ++pointID)
+  for(vtkIdType pointID = 0; pointID < input->GetNumberOfPoints(); ++pointID)
+  //for(vtkIdType pointID = 0; pointID < 4000; ++pointID)
     {
     if(pointID % 1000 == 0)
       {
       std::cout << "point " << pointID << " out of " << input->GetNumberOfPoints() << std::endl;
       }
     //std::cout << "point " << pointID << std::endl;
-    if(pointID == 1313)
-    {
-      std::cout << "here";
-    }
     
     if(superPointLabels[pointID] != UNASSIGNED)
       {
@@ -147,65 +189,34 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
 
     if(ids->GetNumberOfTuples() == 0)
       {
-      continue; //all points in this neighborhood already belong to a superpixel
+      continue; // All points in this neighborhood already belong to a superpixel
       }
 
     vtkSmartPointer<vtkSelectionNode> selectionNode =
       vtkSmartPointer<vtkSelectionNode>::New();
-    selectionNode->SetFieldType(vtkSelectionNode::POINT);
+    selectionNode->SetFieldType(vtkSelectionNode::VERTEX);
     selectionNode->SetContentType(vtkSelectionNode::INDICES);
     selectionNode->SetSelectionList(ids);
 
     vtkSmartPointer<vtkSelection> selection =
       vtkSmartPointer<vtkSelection>::New();
     selection->AddNode(selectionNode);
-
-    vtkSmartPointer<vtkExtractSelection> extractSelection =
-      vtkSmartPointer<vtkExtractSelection>::New();
-    extractSelection->SetInput(0, input);
+    
+    vtkSmartPointer<vtkExtractSelectedGraph> extractSelection =
+      vtkSmartPointer<vtkExtractSelectedGraph>::New();
+    extractSelection->SetInput(0, connectFilter->GetOutput());
     extractSelection->SetInput(1, selection);
     extractSelection->Update();
-
-    vtkDataArray* normalsAfter = vtkDataArray::SafeDownCast(vtkUnstructuredGrid::SafeDownCast(extractSelection->GetOutput())->GetPointData()->GetNormals());
+    
+    //std::cout << "There are " << extractSelection->GetOutput()->GetNumberOfVertices() << " extracted points." << std::endl;
+    
+    vtkDataSetAttributes* vertexData = extractSelection->GetOutput()->GetVertexData();
+        
+    vtkDataArray* normalsAfter = vtkDataArray::SafeDownCast(vertexData->GetNormals());
     
     vtkIdTypeArray* originalIds =
-      vtkIdTypeArray::SafeDownCast(vtkUnstructuredGrid::SafeDownCast(extractSelection->GetOutput())->GetPointData()->GetArray("vtkOriginalPointIds"));
+      vtkIdTypeArray::SafeDownCast(vertexData->GetArray("OriginalIds"));
 
-    //std::cout << "There are " << vtkUnstructuredGrid::SafeDownCast(extractSelection->GetOutput())->GetNumberOfPoints() << " extracted points." << std::endl;
-    
-    
-    // Create a fully connected graph on the points in a e-neighborhood of the query point
-    /*
-    vtkSmartPointer<vtkUnstructuredGridToGraph> unstructuredGridToGraph =
-      vtkSmartPointer<vtkUnstructuredGridToGraph>::New();
-    unstructuredGridToGraph->SetInputConnection(extractSelection->GetOutputPort());
-    unstructuredGridToGraph->Update();
-
-    vtkSmartPointer<vtkFullyConnectedGraphFilter> fullyConnectedFilter =
-      vtkSmartPointer<vtkFullyConnectedGraphFilter>::New();
-    fullyConnectedFilter->SetInputConnection(unstructuredGridToGraph->GetOutputPort());
-    fullyConnectedFilter->Update();
-    */
-    
-    
-    // Create a NN graph on the extracted points
-    vtkSmartPointer<vtkNearestNeighborGraphFilter> nnFilter =
-      vtkSmartPointer<vtkNearestNeighborGraphFilter>::New();
-    if(vtkUnstructuredGrid::SafeDownCast(extractSelection->GetOutput())->GetNumberOfPoints() < nnFilter->GetKNeighbors() + 2)
-      {
-      continue; //there will be some unlabeled points
-      }
-      
-    nnFilter->SetInputConnection(extractSelection->GetOutputPort());
-    nnFilter->Update();
-    
-    // Connect the NN graph
-    vtkSmartPointer<vtkConnectGraph> connectFilter =
-      vtkSmartPointer<vtkConnectGraph>::New();
-    connectFilter->SetInputConnection(nnFilter->GetOutputPort());
-    connectFilter->Update();
-    
-    
     vtkIdType query = -1;
     //map from original id to current id in selected graph
     for(vtkIdType j = 0; j < originalIds->GetNumberOfTuples(); j++)
@@ -225,7 +236,8 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
 
     vtkSmartPointer<vtkGraphVertexDataConditionalIterator> graphIterator =
       vtkSmartPointer<vtkGraphVertexDataConditionalIterator>::New();
-    graphIterator->SetGraph(connectFilter->GetOutput());
+    graphIterator->SetGraph(extractSelection->GetOutput());
+    //graphIterator->SetGraph(connectFilter->GetOutput());
     //graphIterator->SetGraph(fullyConnectedFilter->GetOutput());
     graphIterator->SetStartVertex(query);
     graphIterator->SetConditionTypeToNormalAngle();
@@ -259,6 +271,40 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
     {
     labelArray->InsertNextValue(superPointLabels[i]);
     }
+    
+    
+  // Setup the colors array
+  
+  vtkSmartPointer<vtkLookupTable> lut = 
+    vtkSmartPointer<vtkLookupTable>::New();
+  lut->SetNumberOfTableValues(superPointCenters->GetNumberOfPoints());
+  
+  vtkSmartPointer<vtkUnsignedCharArray> superColors =
+    vtkSmartPointer<vtkUnsignedCharArray>::New();
+  superColors->SetNumberOfComponents(3);
+  superColors->SetName("SuperColors");
+  
+  vtkMath::RandomSeed(time(NULL));
+  
+  for(unsigned int i = 0; i < superPointCenters->GetNumberOfPoints(); i++)
+    {
+    lut->SetTableValue(i, vtkMath::Random(0.0,1.0), vtkMath::Random(0.0,1.0), vtkMath::Random(0.0,1.0));
+    }
+    
+  for(unsigned int i = 0; i < superPointLabels.size(); i++)
+    {
+    double randomRGBA[4];
+    lut->GetTableValue(superPointLabels[i], randomRGBA);
+  
+    unsigned char randomColor[3];
+    randomColor[0] = static_cast<unsigned char>(255. * randomRGBA[0]);
+    randomColor[1] = static_cast<unsigned char>(255. * randomRGBA[1]);
+    randomColor[2] = static_cast<unsigned char>(255. * randomRGBA[2]);
+  
+    std::cout << "Converted " << (int)randomRGBA[0] << " " << (int)randomRGBA[1] << " " << (int)randomRGBA[2]
+	      << " to " << (int)randomColor[0] << " " << (int)randomColor[1] << " " << (int)randomColor[2] << std::endl;
+    superColors->InsertNextTupleValue(randomColor);
+    }
 
   vtkSmartPointer<vtkVertexGlyphFilter> glyphFilter =
     vtkSmartPointer<vtkVertexGlyphFilter>::New();
@@ -268,6 +314,7 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   outputLabeled->ShallowCopy(glyphFilter->GetOutput());
 
   outputLabeled->GetPointData()->SetScalars(labelArray);
+  outputLabeled->GetPointData()->AddArray(superColors);
 
   vtkSmartPointer<vtkPolyData> centersPolyData =
     vtkSmartPointer<vtkPolyData>::New();
@@ -330,10 +377,10 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   vtkUnsignedCharArray* inputColors =
     vtkUnsignedCharArray::SafeDownCast(input->GetPointData()->GetArray("Colors"));
 
-  vtkSmartPointer<vtkUnsignedCharArray> superColors =
+  vtkSmartPointer<vtkUnsignedCharArray> averageColors =
     vtkSmartPointer<vtkUnsignedCharArray>::New();
-  superColors->SetNumberOfComponents(3);
-  superColors->SetName("Colors");
+  averageColors->SetNumberOfComponents(3);
+  averageColors->SetName("AverageColors");
 
   if(inputColors)
     {
@@ -357,13 +404,13 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
       g /= static_cast<double>(count);
       b /= static_cast<double>(count);
 
-      unsigned char superColor[3];
-      superColor[0] = static_cast<unsigned char>(r);
-      superColor[1] = static_cast<unsigned char>(g);
-      superColor[2] = static_cast<unsigned char>(b);
-      superColors->InsertNextTupleValue(superColor);
+      unsigned char averageColor[3];
+      averageColor[0] = static_cast<unsigned char>(r);
+      averageColor[1] = static_cast<unsigned char>(g);
+      averageColor[2] = static_cast<unsigned char>(b);
+      averageColors->InsertNextTupleValue(averageColor);
       }
-    outputCenters->GetPointData()->SetScalars(superColors);
+    outputCenters->GetPointData()->SetScalars(averageColors);
     }
   else
     {
