@@ -55,32 +55,145 @@ vtkSuperPoints::vtkSuperPoints()
   this->AutomaticRadiusRatio = 10;
 }
 
+class vtkCustomGraphIterator : public vtkGraphBFSIterator
+{
+public:
+  static vtkCustomGraphIterator* New();
+  vtkTypeMacro(vtkCustomGraphIterator, vtkGraphBFSIterator);
+
+  vtkCustomGraphIterator(){}
+  ~vtkCustomGraphIterator(){}
+
+  protected:
+    virtual void AddVertex(vtkIdType);
+
+    vtkCustomGraphIterator(const vtkCustomGraphIterator &);  // Not implemented.
+    void operator=(const vtkCustomGraphIterator &);        // Not implemented.
+
+};
+vtkStandardNewMacro(vtkCustomGraphIterator);
+
+// Weight normals, colors, and intensities by normal quality
+void vtkCustomGraphIterator::AddVertex(vtkIdType val)
+{
+  // Hard "use normals" threshold.
+  // If normal error is above 6.6e-06, weight .5(color) + .5(intensity)
+  // If normal error is low, use .33 weight for color, intensity, and normal
+
+  // We will refer to things as "XYZSimilarity". These are scaled from 0 (not similar) to 1 (exactly the same)
+
+  vtkFloatArray* normalError = vtkFloatArray::SafeDownCast(this->Graph->GetVertexData()->GetArray("NormalError"));
+  vtkFloatArray* normals = vtkFloatArray::SafeDownCast(this->Graph->GetVertexData()->GetNormals());
+  vtkUnsignedCharArray* colors = vtkUnsignedCharArray::SafeDownCast(this->Graph->GetVertexData()->GetArray("Colors"));
+  vtkDoubleArray* intensities = vtkDoubleArray::SafeDownCast(this->Graph->GetVertexData()->GetArray("Intensities"));
+
+  if(!normalError)
+    {
+    std::cout << "There is no NormalError array!" << std::endl;
+    exit(-1);
+    }
+  if(!normals)
+    {
+    std::cout << "There is no normals array!" << std::endl;
+    exit(-1);
+    }
+  if(!colors)
+    {
+    std::cout << "There is no Colors array!" << std::endl;
+    exit(-1);
+    }
+  if(!intensities)
+    {
+    std::cout << "There is no Intensities array!" << std::endl;
+    exit(-1);
+    }
+
+  for(vtkIdType i = 0; i < this->Graph->GetNumberOfVertices(); i++)
+    {
+    // Color
+    unsigned char c1[3];
+    colors->GetTupleValue(this->GetVertex(), c1);
+
+    unsigned char c2[3];
+    colors->GetTupleValue(val, c2);
+
+    double colorDistance = sqrt(pow(c1[0] - c2[0],2) + pow(c1[1] - c2[1],2) + pow(c1[2] - c2[2],2)); //low if colors are similar
+    double maxColorDistance = sqrt(pow(255,2) + pow(255,2) + pow(255,2));
+    double colorSimilarity = 1.0 - (colorDistance/maxColorDistance);
+
+    // Normal
+    double n1[3];
+    normals->GetTuple(this->GetVertex(), n1);
+    vtkMath::Normalize(n1);
+    //std::cout << "Point normal " << i << ": " << n[0] << " " << n[1] << " " << n[2] << std::endl;
+
+    double n2[3];
+    normals->GetTuple(val, n2);
+    vtkMath::Normalize(n2);
+
+    double angle = acos(vtkMath::Dot(n1,n2));
+
+    double degAngle = fabs(vtkMath::DegreesFromRadians(angle));
+
+    if(degAngle > 90)
+      {
+      degAngle = 180 - degAngle;
+      }
+
+    double normalSimilarity = 1.0 - (degAngle / 90.);
+
+    // Intensity
+    double intensitySimilarity = 1.0 - fabs(intensities->GetValue(this->GetVertex()) - intensities->GetValue(val));
+
+    // Weight according to normalError
+    double similarity = 0.0;
+    double normalErrorThreshold = 6.6e-06;
+
+    // If both normals are trustable, include the normals
+    if((normalError->GetValue(this->GetVertex()) < normalErrorThreshold) && (normalError->GetValue(val) < normalErrorThreshold))
+      {
+      similarity = .33 * colorSimilarity + .33 * normalSimilarity + .33 * intensitySimilarity;
+      }
+    else // Ignore the normals
+      {
+      similarity = .5 * colorSimilarity + .5 * intensitySimilarity;
+      }
+
+    if(similarity > .9)
+      {
+      this->QueuePushBack(val);
+      }
+
+    } // end for
+}
+
 int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
                                              vtkInformationVector **inputVector,
                                              vtkInformationVector *outputVector)
 {
-  // get the info objects
+  // Get the info objects
   vtkInformation *inInfo = inputVector[0]->GetInformationObject(0);
   vtkInformation *outInfo0 = outputVector->GetInformationObject(0);
   vtkInformation *outInfo1 = outputVector->GetInformationObject(1);
 
-  // get the input and ouptut
+  // Get the input and ouptut
   vtkPolyData *input = vtkPolyData::SafeDownCast(
     inInfo->Get(vtkDataObject::DATA_OBJECT()));
 
-  vtkSmartPointer<vtkIdFilter> idFilter = 
+  vtkSmartPointer<vtkIdFilter> idFilter =
     vtkSmartPointer<vtkIdFilter>::New();
   idFilter->SetInputConnection(input->GetProducerPort());
   idFilter->SetIdsArrayName("OriginalIds");
   idFilter->Update();
-     
+
   vtkDataArray* normalsInput = input->GetPointData()->GetNormals();
   if(!normalsInput)
     {
     std::cerr << " no input normals" << std::endl;
     exit(-1);
     }
-    
+
+
   vtkPolyData *outputLabeled = vtkPolyData::SafeDownCast(
     outInfo0->Get(vtkDataObject::DATA_OBJECT()));
 
@@ -89,7 +202,7 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
 
   if(this->AutomaticRadius)
     {
-    //decide on a reasonable RBNN radius
+    // Decide on a reasonable RBNN radius
     double bounds[6];
     input->GetBounds(bounds);
 
@@ -109,36 +222,36 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
     vtkSmartPointer<vtkNearestNeighborGraphFilter>::New();
   nnFilter->SetInputConnection(idFilter->GetOutputPort());
   nnFilter->Update();
-  
+
   // Connect the NN graph
   vtkSmartPointer<vtkConnectGraph> connectFilter =
     vtkSmartPointer<vtkConnectGraph>::New();
   connectFilter->SetInputConnection(nnFilter->GetOutputPort());
   connectFilter->Update();
-  
+
   {
-  vtkSmartPointer<vtkGraphWriter> graphWriter = 
+  vtkSmartPointer<vtkGraphWriter> graphWriter =
     vtkSmartPointer<vtkGraphWriter>::New();
   graphWriter->SetFileName("NNgraph.graph");
   graphWriter->SetInputConnection(connectFilter->GetOutputPort());
   graphWriter->Write();
-  
-  vtkSmartPointer<vtkGraphToPolyData> graphToPolyData = 
+
+  vtkSmartPointer<vtkGraphToPolyData> graphToPolyData =
     vtkSmartPointer<vtkGraphToPolyData>::New();
   graphToPolyData->SetInputConnection(connectFilter->GetOutputPort());
   graphToPolyData->Update();
-  
-  vtkSmartPointer<vtkXMLPolyDataWriter> graphPolyDataWriter = 
+
+  vtkSmartPointer<vtkXMLPolyDataWriter> graphPolyDataWriter =
     vtkSmartPointer<vtkXMLPolyDataWriter>::New();
   graphPolyDataWriter->SetInputConnection(graphToPolyData->GetOutputPort());
   graphPolyDataWriter->SetFileName("NNgraph.vtp");
   graphPolyDataWriter->Write();
-    
+
   }
-  
-  //create a vector to keep track of the points that are already assigned to a superpoint
+
+  // Create a vector to keep track of the points that are already assigned to a superpoint
   std::vector<int> superPointLabels(input->GetNumberOfPoints(), UNASSIGNED);
- 
+
   //Create a kd tree
   vtkSmartPointer<vtkKdTreePointLocator> kdTree =
     vtkSmartPointer<vtkKdTreePointLocator>::New();
@@ -149,15 +262,15 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   vtkSmartPointer<vtkPoints> superPointCenters =
     vtkSmartPointer<vtkPoints>::New();
 
+  std::vector<int> tooSmallClusters;
+
   for(vtkIdType pointID = 0; pointID < input->GetNumberOfPoints(); ++pointID)
-  //for(vtkIdType pointID = 0; pointID < 4000; ++pointID)
     {
     if(pointID % 1000 == 0)
       {
       std::cout << "point " << pointID << " out of " << input->GetNumberOfPoints() << std::endl;
       }
-    //std::cout << "point " << pointID << std::endl;
-    
+
     if(superPointLabels[pointID] != UNASSIGNED)
       {
       continue;
@@ -173,8 +286,8 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
     kdTree->FindPointsWithinRadius(this->NNRadius, pointID, neighbors, true);
 
     //std::cout << "There are " << neighbors->GetNumberOfIds() << " neighbors." << std::endl;
-    
-    //extract the points around the query point
+
+    // Extract the points around the query point
     vtkSmartPointer<vtkIdTypeArray> ids =
       vtkSmartPointer<vtkIdTypeArray>::New();
     ids->SetNumberOfComponents(1);
@@ -201,24 +314,24 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
     vtkSmartPointer<vtkSelection> selection =
       vtkSmartPointer<vtkSelection>::New();
     selection->AddNode(selectionNode);
-    
+
     vtkSmartPointer<vtkExtractSelectedGraph> extractSelection =
       vtkSmartPointer<vtkExtractSelectedGraph>::New();
     extractSelection->SetInput(0, connectFilter->GetOutput());
     extractSelection->SetInput(1, selection);
     extractSelection->Update();
-    
+
     //std::cout << "There are " << extractSelection->GetOutput()->GetNumberOfVertices() << " extracted points." << std::endl;
-    
+
     vtkDataSetAttributes* vertexData = extractSelection->GetOutput()->GetVertexData();
-        
+
     vtkDataArray* normalsAfter = vtkDataArray::SafeDownCast(vertexData->GetNormals());
-    
+
     vtkIdTypeArray* originalIds =
       vtkIdTypeArray::SafeDownCast(vertexData->GetArray("OriginalIds"));
 
     vtkIdType query = -1;
-    //map from original id to current id in selected graph
+    // Map from original id to current id in selected graph
     for(vtkIdType j = 0; j < originalIds->GetNumberOfTuples(); j++)
       {
       if(originalIds->GetValue(j) == pointID)
@@ -234,30 +347,48 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
       exit(-1);
       }
 
-    vtkSmartPointer<vtkGraphVertexDataConditionalIterator> graphIterator =
-      vtkSmartPointer<vtkGraphVertexDataConditionalIterator>::New();
+
+    vtkSmartPointer<vtkCustomGraphIterator> graphIterator =
+      vtkSmartPointer<vtkCustomGraphIterator>::New();
     graphIterator->SetGraph(extractSelection->GetOutput());
-    //graphIterator->SetGraph(connectFilter->GetOutput());
-    //graphIterator->SetGraph(fullyConnectedFilter->GetOutput());
     graphIterator->SetStartVertex(query);
-    graphIterator->SetConditionTypeToNormalAngle();
-    graphIterator->SetComparisonDirectionToLessThan();
-    graphIterator->SetAcceptableValue(10);
     graphIterator->Initialize();
-    
+
     superPointLabels[pointID] = superPointID;
 
+    int numberOfConnectedPoints = 0;
     while(graphIterator->HasNext())
       {
       vtkIdType nextVertex = graphIterator->Next();
       superPointLabels[originalIds->GetValue(nextVertex)] = superPointID;
+      numberOfConnectedPoints++;
+      }
+
+    if(numberOfConnectedPoints < 10)
+      {
+      tooSmallClusters.push_back(superPointID);
       }
 
     superPointID++;
 
     } //end for
 
-  //color points
+  int tooSmallLabel = superPointID;
+
+  // Re-label all points belonging to too small of clusters the same label
+  for(unsigned int i = 0; i < superPointLabels.size(); i++)
+    {
+    for(unsigned int j = 0; j < tooSmallClusters.size(); j++)
+      {
+      if(superPointLabels[i] == tooSmallClusters[j])
+        {
+        superPointLabels[i] = tooSmallLabel;
+        break;
+        }
+      }
+    }
+
+  // Color points
   vtkSmartPointer<vtkPolyData> polydata =
     vtkSmartPointer<vtkPolyData>::New();
   polydata->SetPoints(input->GetPoints());
@@ -271,38 +402,36 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
     {
     labelArray->InsertNextValue(superPointLabels[i]);
     }
-    
-    
+
+
   // Setup the colors array
-  
-  vtkSmartPointer<vtkLookupTable> lut = 
+
+  vtkSmartPointer<vtkLookupTable> lut =
     vtkSmartPointer<vtkLookupTable>::New();
   lut->SetNumberOfTableValues(superPointCenters->GetNumberOfPoints());
-  
+
   vtkSmartPointer<vtkUnsignedCharArray> superColors =
     vtkSmartPointer<vtkUnsignedCharArray>::New();
   superColors->SetNumberOfComponents(3);
   superColors->SetName("SuperColors");
-  
+
   vtkMath::RandomSeed(time(NULL));
-  
+
   for(unsigned int i = 0; i < superPointCenters->GetNumberOfPoints(); i++)
     {
     lut->SetTableValue(i, vtkMath::Random(0.0,1.0), vtkMath::Random(0.0,1.0), vtkMath::Random(0.0,1.0));
     }
-    
+
   for(unsigned int i = 0; i < superPointLabels.size(); i++)
     {
     double randomRGBA[4];
     lut->GetTableValue(superPointLabels[i], randomRGBA);
-  
+
     unsigned char randomColor[3];
     randomColor[0] = static_cast<unsigned char>(255. * randomRGBA[0]);
     randomColor[1] = static_cast<unsigned char>(255. * randomRGBA[1]);
     randomColor[2] = static_cast<unsigned char>(255. * randomRGBA[2]);
-  
-    std::cout << "Converted " << (int)randomRGBA[0] << " " << (int)randomRGBA[1] << " " << (int)randomRGBA[2]
-	      << " to " << (int)randomColor[0] << " " << (int)randomColor[1] << " " << (int)randomColor[2] << std::endl;
+
     superColors->InsertNextTupleValue(randomColor);
     }
 
@@ -312,8 +441,9 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   glyphFilter->Update();
 
   outputLabeled->ShallowCopy(glyphFilter->GetOutput());
+  outputLabeled->GetPointData()->PassData(input->GetPointData());
 
-  outputLabeled->GetPointData()->SetScalars(labelArray);
+  outputLabeled->GetPointData()->AddArray(labelArray);
   outputLabeled->GetPointData()->AddArray(superColors);
 
   vtkSmartPointer<vtkPolyData> centersPolyData =
@@ -331,47 +461,86 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   vtkDataArray* inputNormals =
     vtkDataArray::SafeDownCast(input->GetPointData()->GetNormals());
 
-  vtkSmartPointer<vtkDoubleArray> superNormals =
-    vtkSmartPointer<vtkDoubleArray>::New();
-  superNormals->SetNumberOfComponents(3);
-  superNormals->SetName("Normals");
+  //vtkSmartPointer<vtkDoubleArray> averageNormals =
+    //vtkSmartPointer<vtkDoubleArray>::New();
+  vtkSmartPointer<vtkFloatArray> averageNormals =
+    vtkSmartPointer<vtkFloatArray>::New();
+  averageNormals->SetNumberOfComponents(3);
+  averageNormals->SetName("Normals");
 
-  if(inputNormals)
+  for(vtkIdType superID = 0; superID < centersPolyData->GetNumberOfPoints(); superID++)
     {
-    for(vtkIdType superID = 0; superID < centersPolyData->GetNumberOfPoints(); superID++)
+    double x=0; double y=0; double z=0;
+    int count = 0;
+    for(vtkIdType point = 0; point < outputLabeled->GetNumberOfPoints(); point++)
       {
-      double x=0; double y=0; double z=0;
-      int count = 0;
-      for(vtkIdType point = 0; point < outputLabeled->GetNumberOfPoints(); point++)
+      if(superPointLabels[point] == superID)
         {
-        if(superPointLabels[point] == superID)
-          {
-          double n[3];
-          inputNormals->GetTuple(point, n);
-          x += n[0];
-          y += n[1];
-          z += n[2];
-          count++;
-          }
+        double n[3];
+        inputNormals->GetTuple(point, n);
+        x += n[0];
+        y += n[1];
+        z += n[2];
+        count++;
         }
-      x /= static_cast<double>(count);
-      y /= static_cast<double>(count);
-      z /= static_cast<double>(count);
-
-      double superNormal[3];
-      superNormal[0] = x;
-      superNormal[1] = y;
-      superNormal[2] = z;
-      superNormals->InsertNextTupleValue(superNormal);
       }
 
-    outputCenters->GetPointData()->SetNormals(superNormals);
-    }
-  else
-    {
-    std::cerr << "No normals on input!" << std::endl;
+    /*
+    x /= static_cast<double>(count);
+    y /= static_cast<double>(count);
+    z /= static_cast<double>(count);
+    */
+    if(count > 0)
+      {
+      x /= static_cast<float>(count);
+      y /= static_cast<float>(count);
+      z /= static_cast<float>(count);
+      }
+    else
+      {
+      x = 1;
+      y = 0;
+      z = 0;
+      }
+    //double superNormal[3];
+    float superNormal[3];
+    superNormal[0] = x;
+    superNormal[1] = y;
+    superNormal[2] = z;
+    averageNormals->InsertNextTupleValue(superNormal);
     }
 
+  outputCenters->GetPointData()->SetNormals(averageNormals);
+
+  // Average intensities
+  //vtkDataArray* inputIntensities =
+    //vtkDataArray::SafeDownCast(input->GetPointData()->GetArray("Intensities"));
+  vtkDoubleArray* inputIntensities =
+    vtkDoubleArray::SafeDownCast(input->GetPointData()->GetArray("Intensities"));
+
+  vtkSmartPointer<vtkDoubleArray> averageIntensities =
+    vtkSmartPointer<vtkDoubleArray>::New();
+  averageIntensities->SetNumberOfComponents(1);
+  averageIntensities->SetName("Intensities");
+
+  for(vtkIdType superID = 0; superID < centersPolyData->GetNumberOfPoints(); superID++)
+    {
+    double intensities = 0.0;
+    int count = 0;
+    for(vtkIdType point = 0; point < outputLabeled->GetNumberOfPoints(); point++)
+      {
+      if(superPointLabels[point] == superID)
+        {
+        double intensity = inputIntensities->GetValue(point);
+        intensities += intensity;
+        count++;
+        }
+      }
+    intensities /= static_cast<double>(count);
+    averageIntensities->InsertNextValue(intensities);
+    }
+
+  outputCenters->GetPointData()->AddArray(averageIntensities);
 
   // Average colors
   vtkUnsignedCharArray* inputColors =
@@ -380,43 +549,36 @@ int vtkSuperPoints::RequestData(vtkInformation *vtkNotUsed(request),
   vtkSmartPointer<vtkUnsignedCharArray> averageColors =
     vtkSmartPointer<vtkUnsignedCharArray>::New();
   averageColors->SetNumberOfComponents(3);
-  averageColors->SetName("AverageColors");
+  averageColors->SetName("Colors");
 
-  if(inputColors)
+  for(vtkIdType superID = 0; superID < centersPolyData->GetNumberOfPoints(); superID++)
     {
-    for(vtkIdType superID = 0; superID < centersPolyData->GetNumberOfPoints(); superID++)
+    double r=0; double g=0; double b=0;
+    int count = 0;
+    for(vtkIdType point = 0; point < outputLabeled->GetNumberOfPoints(); point++)
       {
-      double r=0; double g=0; double b=0;
-      int count = 0;
-      for(vtkIdType point = 0; point < outputLabeled->GetNumberOfPoints(); point++)
+      if(superPointLabels[point] == superID)
         {
-        if(superPointLabels[point] == superID)
-          {
-          unsigned char c[3];
-          inputColors->GetTupleValue(point, c);
-          r += c[0];
-          g += c[1];
-          b += c[2];
-          count++;
-          }
+        unsigned char c[3];
+        inputColors->GetTupleValue(point, c);
+        r += c[0];
+        g += c[1];
+        b += c[2];
+        count++;
         }
-      r /= static_cast<double>(count);
-      g /= static_cast<double>(count);
-      b /= static_cast<double>(count);
-
-      unsigned char averageColor[3];
-      averageColor[0] = static_cast<unsigned char>(r);
-      averageColor[1] = static_cast<unsigned char>(g);
-      averageColor[2] = static_cast<unsigned char>(b);
-      averageColors->InsertNextTupleValue(averageColor);
       }
-    outputCenters->GetPointData()->SetScalars(averageColors);
+    r /= static_cast<double>(count);
+    g /= static_cast<double>(count);
+    b /= static_cast<double>(count);
+
+    unsigned char averageColor[3];
+    averageColor[0] = static_cast<unsigned char>(r);
+    averageColor[1] = static_cast<unsigned char>(g);
+    averageColor[2] = static_cast<unsigned char>(b);
+    averageColors->InsertNextTupleValue(averageColor);
     }
-  else
-    {
-    std::cerr << "No colors on input!" << std::endl;
-    }
-    
+  outputCenters->GetPointData()->AddArray(averageColors);
+
   return 1;
 }
 
